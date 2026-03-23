@@ -1,0 +1,18 @@
+[project]
+name = "snowflake-ml-e2e-fraud"
+version = "0.1.0"
+description = "E2E Demo Project for Fraud Detection on Snowflake"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "llvmlite>=0.46.0",
+    "numpy>=2.4.3",
+    "snowflake-ml-python>=1.30.0",
+    "snowflake-snowpark-python>=1.47.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipython>=9.11.0",
+    "ruff>=0.15.6",
+]
