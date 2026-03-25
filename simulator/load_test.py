@@ -7,7 +7,7 @@ Runs concurrent transactions through the full pipeline:
 
 Usage:
     export SNOWFLAKE_PAT=<token>
-    python simulator/load_test.py -n 100 -c 10 --connection Trace-CoCo
+    python simulator/load_test.py -n 100 -c 10 --connection <connection-name>
 """
 
 import argparse

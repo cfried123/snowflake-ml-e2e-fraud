@@ -6,7 +6,7 @@ Streams synthetic transactions to the TRANSACTIONS table, which feeds
 the Dynamic Tables in the Feature Store (refreshing every 1 minute).
 
 Usage:
-    python simulator/transactions.py -n 100 --delay 0.5 --connection Trace-CoCo
+    python simulator/transactions.py -n 100 --delay 0.5 --connection <connection-name>
 """
 
 import argparse
