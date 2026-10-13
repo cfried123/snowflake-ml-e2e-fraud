@@ -17,6 +17,8 @@ import time
 from datetime import datetime
 from typing import Dict, Optional
 
+from snowflake.snowpark import Session
+
 MODEL_NAME = "FRAUD_DETECTION_MODEL"
 MIN_IMPROVEMENT = 0.01
 MAX_REGRESSION = 0.01
@@ -202,7 +204,9 @@ def _float(value) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 
-def train_challenger(session, database: str, schema: str, compute_pool: str) -> str:
+def train_challenger(
+    session: Session, database: str, schema: str, compute_pool: str
+) -> str:
     """Run ``source/train.py`` as an ML Job and log challenger metrics."""
     from snowflake.ml.jobs import submit_directory
 
@@ -296,7 +300,7 @@ def _latest_step(session, database: str, schema: str, step: str, status=None):
     return rows[0].as_dict() if rows else None
 
 
-def validate_challenger(session, database: str, schema: str) -> str:
+def validate_challenger(session: Session, database: str, schema: str) -> str:
     ensure_tables(session, database, schema)
     train = _latest_step(session, database, schema, "TRAIN", "SUCCESS")
     if not train:
@@ -347,7 +351,7 @@ def validate_challenger(session, database: str, schema: str) -> str:
     return decision["message"]
 
 
-def promote_if_better(session, database: str, schema: str) -> str:
+def promote_if_better(session: Session, database: str, schema: str) -> str:
     from snowflake.snowpark import functions as F
 
     ensure_tables(session, database, schema)
@@ -433,7 +437,7 @@ def _metric_value(row: Dict) -> Optional[float]:
 
 
 def check_model_drift(
-    session,
+    session: Session,
     database: str,
     schema: str,
     monitor_name: str,
