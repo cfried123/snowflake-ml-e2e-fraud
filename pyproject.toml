@@ -14,5 +14,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipython>=9.11.0",
+    "pytest>=8.3",
     "ruff>=0.15.6",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: uses Snowpark local testing mode (~30s)"]

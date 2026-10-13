@@ -2,133 +2,30 @@
 """Single transaction prediction with latency breakdown.
 
 Uses raw SQL against online feature tables for low-latency feature lookups.
+Feature-vector building, model calls and decision bands are shared with
+``load_test.py`` via ``inference.py``.
 """
 
 import argparse
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 
 import numpy as np
-import requests
-from snowflake.snowpark import Session
 
-from config import (
-    DATABASE,
-    FEATURE_SERVING_WH,
-    FEATURE_STORE_SCHEMA,
-    MODEL_NAME,
-    SCHEMA,
+from config import DATABASE, SCHEMA
+from inference import (
+    AGG_FV_NAME,
+    PROFILE_FV_NAME,
+    build_feature_vector,
+    call_model,
+    fetch_online_features,
+    get_decision,
+    get_endpoint_url,
+    get_session,
+    load_decision_thresholds,
+    resolve_service,
 )
-
-ONLINE_TABLES = {
-    "CUSTOMER_PROFILE_FEATURES": (
-        f'{DATABASE}.{FEATURE_STORE_SCHEMA}."CUSTOMER_PROFILE_FEATURES$V1$ONLINE"',
-        [
-            "ACCOUNT_AGE_DAYS",
-            "CREDIT_SCORE",
-            "AVG_MONTHLY_TRANSACTIONS",
-            "AVG_TRANSACTION_AMOUNT",
-            "NUM_CARDS_ON_FILE",
-            "IS_PREMIUM_MEMBER",
-            "NUM_PREVIOUS_FRAUD_REPORTS",
-        ],
-    ),
-    "CUSTOMER_AGG_FEATURES": (
-        f'{DATABASE}.{FEATURE_STORE_SCHEMA}."CUSTOMER_AGG_FEATURES$V1$ONLINE"',
-        [
-            "AVG_TXN_AMOUNT",
-            "STD_TXN_AMOUNT",
-            "MAX_TXN_AMOUNT",
-            "MIN_TXN_AMOUNT",
-            "TOTAL_TXN_AMOUNT",
-            "TXN_COUNT",
-            "AVG_TXN_HOUR",
-            "STD_TXN_HOUR",
-            "INTL_TXN_COUNT",
-            "INTL_TXN_RATIO",
-            "CARD_PRESENT_RATIO",
-        ],
-    ),
-}
-
-
-def _fetch_one_table(
-    session: Session,
-    name: str,
-    table_fqn: str,
-    columns: list[str],
-    customer_id: str,
-) -> tuple[str, dict, float]:
-    """Fetch features from one online table (designed to run in a thread)."""
-    cols = ", ".join(f'"{c}"' for c in columns)
-    t0 = time.time()
-    rows = session.sql(
-        f"SELECT {cols} FROM {table_fqn} WHERE CUSTOMER_ID = '{customer_id}'"
-    ).collect()
-    elapsed_ms = (time.time() - t0) * 1000
-    row_dict = rows[0].as_dict() if rows else {}
-    return name, row_dict, elapsed_ms
-
-
-def get_features_from_store(
-    session: Session, customer_id: str
-) -> tuple[dict, dict[str, float]]:
-    """Fetch features from online tables in parallel via raw SQL."""
-    features = {}
-    latencies = {}
-
-    with ThreadPoolExecutor(max_workers=len(ONLINE_TABLES)) as pool:
-        futures = {
-            pool.submit(_fetch_one_table, session, name, tbl, cols, customer_id): name
-            for name, (tbl, cols) in ONLINE_TABLES.items()
-        }
-        for fut in as_completed(futures):
-            name, row_dict, elapsed_ms = fut.result()
-            latencies[name] = elapsed_ms
-            features.update(row_dict)
-
-    return features, latencies
-
-
-def build_feature_vector(
-    f: dict, amount: float, hour: int, card_present: int, is_intl: int
-) -> list:
-    """Build the 27-feature vector for model inference."""
-    avg_txn = f.get("AVG_TXN_AMOUNT") or 100
-    max_txn = f.get("MAX_TXN_AMOUNT") or 500
-    return [
-        int(f.get("ACCOUNT_AGE_DAYS") or 365),
-        int(f.get("CREDIT_SCORE") or 700),
-        int(f.get("AVG_MONTHLY_TRANSACTIONS") or 20),
-        float(f.get("AVG_TRANSACTION_AMOUNT") or 100),
-        int(f.get("NUM_CARDS_ON_FILE") or 1),
-        int(f.get("IS_PREMIUM_MEMBER") or 0),
-        int(f.get("NUM_PREVIOUS_FRAUD_REPORTS") or 0),
-        float(avg_txn),
-        float(f.get("STD_TXN_AMOUNT") or 50),
-        float(max_txn),
-        float(f.get("MIN_TXN_AMOUNT") or 10),
-        float(f.get("TOTAL_TXN_AMOUNT") or 2000),
-        int(f.get("TXN_COUNT") or 20),
-        float(f.get("AVG_TXN_HOUR") or 12),
-        float(f.get("STD_TXN_HOUR") or 4),
-        int(f.get("INTL_TXN_COUNT") or 0),
-        float(f.get("INTL_TXN_RATIO") or 0),
-        float(f.get("CARD_PRESENT_RATIO") or 0.7),
-        float(amount),
-        int(hour),
-        int(datetime.now().weekday()),
-        int(datetime.now().weekday() >= 5),
-        int(card_present),
-        int(is_intl),
-        float(amount / (avg_txn + 1)),
-        float(amount / (max_txn + 1)),
-        int(amount > avg_txn * 3),
-        int(hour in [0, 1, 2, 3, 4, 5]),
-        float(is_intl * 2 + (1 - card_present) * 1.5),
-    ]
+from source.utils import agg_col, is_odd_hour
 
 
 def main():
@@ -150,10 +47,7 @@ def main():
 
     print("Connecting to Snowflake...")
     conn_start = time.time()
-    session = Session.builder.config("connection_name", args.connection).getOrCreate()
-    session.sql("USE ROLE ACCOUNTADMIN").collect()
-    session.sql(f"USE DATABASE {DATABASE}").collect()
-    session.sql(f"USE WAREHOUSE {FEATURE_SERVING_WH}").collect()
+    session = get_session(args.connection)
     conn_ms = (time.time() - conn_start) * 1000
     print(f"  Connection: {conn_ms:.0f}ms")
 
@@ -189,108 +83,74 @@ def main():
     print(f"\n{'=' * 60}")
     print("FEATURE LOOKUP (Raw SQL → Online Feature Tables)")
     fs_start = time.time()
-    f, fv_latencies = get_features_from_store(session, customer_id)
+    online, fv_latencies = fetch_online_features(session, customer_id)
     fs_ms = (time.time() - fs_start) * 1000
     print(f"  Total Latency: {fs_ms:.0f}ms")
     for fv_name, fv_ms in fv_latencies.items():
         print(f"    {fv_name}: {fv_ms:.0f}ms")
 
-    if not f:
-        print(f"  ERROR: No features found for customer {customer_id}")
+    profile = online.get(PROFILE_FV_NAME, {})
+    agg = online.get(AGG_FV_NAME, {})
+    if not profile:
+        print(f"  ERROR: No profile features found for customer {customer_id}")
         session.close()
         return
 
     print("\n  Profile Features:")
-    print(f"    Account Age:     {f.get('ACCOUNT_AGE_DAYS', 'N/A')} days")
-    print(f"    Credit Score:    {f.get('CREDIT_SCORE', 'N/A')}")
-    print(f"    Premium Member:  {'Yes' if f.get('IS_PREMIUM_MEMBER') else 'No'}")
-    print(f"    Fraud Reports:   {f.get('NUM_PREVIOUS_FRAUD_REPORTS', 0)}")
+    print(f"    Account Age:     {profile.get('ACCOUNT_AGE_DAYS', 'N/A')} days")
+    print(f"    Credit Score:    {profile.get('CREDIT_SCORE', 'N/A')}")
+    print(f"    Premium Member:  {'Yes' if profile.get('IS_PREMIUM_MEMBER') else 'No'}")
+    print(f"    Fraud Reports:   {profile.get('NUM_PREVIOUS_FRAUD_REPORTS', 0)}")
 
-    print("\n  Aggregate Features:")
-    avg_txn = f.get("AVG_TXN_AMOUNT") or 100
-    max_txn = f.get("MAX_TXN_AMOUNT") or 500
-    print(f"    Avg Amount:      ${avg_txn:,.2f}")
-    print(f"    Max Amount:      ${max_txn:,.2f}")
-    print(f"    Txn Count:       {f.get('TXN_COUNT', 'N/A')}")
-    print(f"    Intl Ratio:      {(f.get('INTL_TXN_RATIO') or 0) * 100:.1f}%")
-    print(f"    Card Present:    {(f.get('CARD_PRESENT_RATIO') or 0) * 100:.1f}%")
+    print("\n  Aggregate Features (current window):")
+    txn_count = agg.get(agg_col("TXN_COUNT")) or 0
+    avg_txn = agg.get(agg_col("AVG_TXN_AMOUNT"))
+    if not txn_count:
+        print("    No recent history (HAS_HISTORY=0)")
+    else:
+        print(f"    Avg Amount:      ${avg_txn:,.2f}")
+        print(f"    Max Amount:      ${agg.get(agg_col('MAX_TXN_AMOUNT')):,.2f}")
+        print(f"    Txn Count:       {txn_count}")
+        print(
+            f"    Intl Ratio:      {(agg.get(agg_col('INTL_TXN_RATIO')) or 0) * 100:.1f}%"
+        )
+        print(
+            f"    Card Present:    {(agg.get(agg_col('CARD_PRESENT_RATIO')) or 0) * 100:.1f}%"
+        )
 
-    feature_vector = build_feature_vector(f, amount, hour, card_present, is_intl)
+    feature_vector = build_feature_vector(online, amount, hour, card_present, is_intl)
 
     print(f"\n{'=' * 60}")
     print("RESOLVING MODEL SERVICE")
-    svc_rows = session.sql(f"SHOW SERVICES IN SCHEMA {DATABASE}.{SCHEMA}").collect()
-    service_name = None
-    for row in svc_rows:
-        rd = row.as_dict()
-        if (
-            rd.get("managing_object_domain") == "Model"
-            and MODEL_NAME in (rd.get("managing_object_name") or "")
-            and str(rd.get("is_job")).lower() == "false"
-            and rd.get("status") not in ("DONE", "FAILED")
-        ):
-            service_name = rd["name"]
-            break
-
+    service_name = resolve_service(session)
     if not service_name:
         print("ERROR: No inference service found for model")
         session.close()
         return
-
     print(f"  Service: {service_name}")
 
-    if rd.get("status") == "SUSPENDED":
-        print("  Service is suspended, resuming...")
-        session.sql(
-            f"ALTER SERVICE {DATABASE}.{SCHEMA}.{service_name} RESUME"
-        ).collect()
-        print("  Waiting for service to start...")
-        time.sleep(5)
-
-    endpoint_rows = session.sql(
-        f"SHOW ENDPOINTS IN SERVICE {DATABASE}.{SCHEMA}.{service_name}"
-    ).collect()
-    endpoint_url = None
-    for row in endpoint_rows:
-        row_dict = row.as_dict()
-        if row_dict.get("is_public") and row_dict.get("ingress_url"):
-            endpoint_url = f"https://{row_dict['ingress_url']}"
-            break
-
+    endpoint_url = get_endpoint_url(session, service_name)
     if not endpoint_url:
         print("ERROR: No public endpoint found")
         session.close()
         return
 
+    review_th, decline_th, th_source = load_decision_thresholds(session, service_name)
+    print(
+        f"  Decision bands ({th_source}): REVIEW >= {review_th:.3f}, DECLINE >= {decline_th:.3f}"
+    )
+
     print(f"\n{'=' * 60}")
     print("MODEL INFERENCE")
     inf_start = time.time()
-    resp = requests.post(
-        f"{endpoint_url}/predict-proba",
-        json={"data": [[0] + feature_vector]},
-        headers={
-            "Authorization": f'Snowflake Token="{pat_token}"',
-            "Content-Type": "application/json",
-        },
-        timeout=30,
-    )
+    result = call_model(endpoint_url, pat_token, feature_vector)
     inf_ms = (time.time() - inf_start) * 1000
     print(f"  Latency: {inf_ms:.0f}ms")
+    if not result["success"]:
+        print(f"  ERROR: {result['status_code']} - {result['error']}")
+    prob = result["prob"]
 
-    prob = 0.0
-    if resp.status_code == 200:
-        data = resp.json().get("data", [[]])[0]
-        if len(data) >= 2:
-            pred = data[1]
-            prob = (
-                float(pred.get("output_feature_1", 0))
-                if isinstance(pred, dict)
-                else float(pred)
-            )
-    else:
-        print(f"  ERROR: {resp.status_code} - {resp.text}")
-
-    decision = "DECLINE" if prob >= 0.7 else "REVIEW" if prob >= 0.3 else "APPROVE"
+    decision = get_decision(prob, review_th, decline_th)
     decision_color = {
         "APPROVE": "\033[92m",
         "REVIEW": "\033[93m",
@@ -303,22 +163,19 @@ def main():
     print(f"  Decision:          {decision_color[decision]}{decision}\033[0m")
 
     print("\n  Risk Factors:")
-    amount_ratio = amount / (avg_txn + 1)
-    if amount_ratio > 3:
-        print(f"    [!] Amount is {amount_ratio:.1f}x average")
-    if hour in [0, 1, 2, 3, 4, 5]:
-        print(f"    [!] Unusual hour ({hour}:00)")
-    if is_intl and (f.get("INTL_TXN_RATIO") or 0) < 0.1:
-        print("    [!] International (customer rarely does intl)")
-    if not card_present and (f.get("CARD_PRESENT_RATIO") or 0) > 0.8:
-        print("    [!] Card not present (customer usually uses card)")
-    if (
-        amount_ratio <= 3
-        and hour not in [0, 1, 2, 3, 4, 5]
-        and not is_intl
-        and card_present
-    ):
-        print("    None detected")
+    factors = []
+    if avg_txn and amount / (avg_txn + 1) > 3:
+        factors.append(f"Amount is {amount / (avg_txn + 1):.1f}x recent average")
+    if is_odd_hour(hour):
+        factors.append(f"Unusual hour ({hour}:00)")
+    if is_intl and (agg.get(agg_col("INTL_TXN_RATIO")) or 0) < 0.1:
+        factors.append("International (customer rarely does intl)")
+    if not card_present and (agg.get(agg_col("CARD_PRESENT_RATIO")) or 0) > 0.8:
+        factors.append("Card not present (customer usually uses card)")
+    if not txn_count:
+        factors.append("No recent customer history")
+    for factor in factors or ["None detected"]:
+        print(f"    [!] {factor}" if factors else f"    {factor}")
 
     print(f"\n{'=' * 60}")
     print("LATENCY SUMMARY")

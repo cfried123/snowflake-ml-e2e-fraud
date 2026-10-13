@@ -54,14 +54,24 @@ This project demonstrates a production-ready fraud detection system using:
 - Fraud patterns: high-value, odd-hours, international, card-not-present
 
 ### Feature Engineering
+All feature names, aggregation logic and derived features are defined once in `source/utils.py` (`get_feature_columns()` / `FEATURE_COLS`) and shared by training (`source/train.py`), the notebooks, the DAG procedures, the monitor and the simulator.
 - **Customer Profile Features**: Account age, credit score, fraud history (daily refresh FeatureView)
-- **Aggregated Features**: Transaction statistics via Snowpark DataFrame — AVG, STDDEV, MAX, MIN, counts, ratios (1-minute refresh FeatureView, auto-managed Dynamic Table)
-- **Derived Features**: Amount ratios, risk score — computed inline at training time
+- **Aggregated Features** (`D7_*`, 7-day window): AVG, STDDEV, MAX, MIN, sum, count, ratios, plus `HAS_HISTORY` and `D7_MINUTES_SINCE_LAST_TXN`
+  - *Training*: `TRANSACTION_PIT_AGG_FEATURES` — **point-in-time** per transaction, using only that customer's transactions in `[ts - 7d, ts)` (no future or same-transaction leakage)
+  - *Serving*: `CUSTOMER_AGG_FEATURES` — current 7-day window per customer, online-enabled, 1-minute refresh
+  - No history → `HAS_HISTORY = 0`, zero counts/sums, NULL means/std/ratios (no silent zero-fill)
+- **Derived Features**: Amount-to-average/max ratios, high-value and odd-hour flags, minutes since last transaction
+- **Baseline only**: `RISK_SCORE` is a hand-built heuristic that partially encodes the label rules, so it is **excluded from model inputs** and only reported as a comparison baseline
 
-### Model Performance
-- Handles 50:1 class imbalance with `scale_pos_weight`
-- BayesOpt HPO via Tuner API (10 trials)
-- Tracked metrics: Precision, Recall, F1, AUC-ROC, AUC-PR
+### Model Evaluation
+- **Time-based split**: sorted by `TRANSACTION_TIMESTAMP`; oldest 64% train, next 16% validation, most recent 20% test
+- **Metrics**: AUC-PR, recall at 1% / 5% FPR, precision / recall / F1 at the chosen threshold, AUC-ROC (reference)
+- **Decision thresholds** are selected on validation data and persisted with the model (pickle, registry metrics, `PIPELINE_RUN_LOG`):
+  - `decline_threshold` — maximizes F1 on the precision-recall curve (the binary operating threshold)
+  - `review_threshold` — highest score that still reaches 90% recall (`REVIEW_TARGET_RECALL`)
+  - Bands: `score < review` → APPROVE, `review ≤ score < decline` → REVIEW, `score ≥ decline` → DECLINE. The simulator reads these from the deployed version's registry metrics (fixed 30%/70% only as a fallback)
+- **Artifacts per run** (`@ML_MODELS/runs/<RUN_ID>/`): model + thresholds, metrics, `feature_importance.json` (XGBoost gain + mean |SHAP|), also logged to Experiment Tracking
+- Handles 50:1 class imbalance with `scale_pos_weight`; BayesOpt HPO via Tuner API (10 trials, optimizes validation AUC-PR)
 
 ## Project Structure
 
@@ -74,10 +84,13 @@ This project demonstrates a production-ready fraud detection system using:
 │   ├── 04_model_deployment.ipynb
 │   └── 05_model_monitoring.ipynb
 ├── pipeline/
-│   └── ml_dag.ipynb
+│   ├── ml_dag.ipynb
+│   └── dag_procs.py           # Stored-procedure handlers (train/validate/promote/drift check)
+├── simulator/                 # Real-time scoring + load test (see simulator/README.md)
 ├── source/
 │   ├── train.py               # XGBoost training script (runs as ML Job on SPCS)
-│   └── utils.py               # Synthetic data generation utilities
+│   └── utils.py               # Feature contract, feature engineering, synthetic data, evaluation
+├── tests/                     # pytest: leakage, injection consistency, feature contract, promotion gate
 └── README.md
 ```
 
@@ -92,28 +105,44 @@ This project demonstrates a production-ready fraud detection system using:
 |-------|-------------|
 | `TRANSACTIONS` | Raw synthetic transaction data (100K rows) |
 | `CUSTOMER_PROFILES` | Customer attributes (2K customers) |
-| `FRAUD_TRAINING_DATA` | Final training dataset (30 features) |
-| `FRAUD_TEST_DATA` | Holdout test set from training job |
+| `FRAUD_TRAINING_DATA` | Final training dataset (30 model features + IDs, timestamp, `RISK_SCORE` baseline, label) |
+| `FRAUD_TEST_DATA` | Holdout predictions from every training run, keyed by `RUN_ID` / `MODEL_VERSION` (appended, never overwritten) |
 | `FRAUD_MONITORING_BASELINE` | Training distribution snapshot for drift detection |
-| `MODEL_CHAMPION_TRACKER` | Current champion model version and AUC |
-| `PIPELINE_RUN_LOG` | DAG execution history |
+| `MODEL_CHAMPION_TRACKER` | Current champion version, AUC-PR, recall@1%FPR, AUC-ROC and decision thresholds |
+| `PIPELINE_RUN_LOG` | DAG execution history (train / validate / promote / drift check) |
+| `MODEL_DRIFT_LOG` | Per-feature PSI from each drift check |
 
 ### Dynamic Tables
 | Table | Refresh | Managed By |
 |-------|---------|------------|
-| `AGGREGATED_FEATURES` | 1 minute | Feature Store (auto-created from FeatureView) |
+| `CUSTOMER_AGG_FEATURES$V5` | 1 minute | Feature Store (online serving aggregates) |
+| `TRANSACTION_PIT_AGG_FEATURES$V1` | 1 day | Feature Store (point-in-time training aggregates) |
 | `FRAUD_INFERENCE_AUTOCAPTURE` | 10 minutes | Model Monitor pipeline |
 
 ### Feature Views
 - `CUSTOMER_PROFILE_FEATURES` (V1) — online enabled
-- `CUSTOMER_AGG_FEATURES` (V1) — online enabled, 1-minute refresh
+- `CUSTOMER_AGG_FEATURES` (V5) — online enabled, 1-minute refresh, current 7-day window
+- `TRANSACTION_PIT_AGG_FEATURES` (V1) — offline, per-transaction point-in-time aggregates for training
 
 ### Tasks (Champion/Challenger DAG)
 | Task | Schedule | Description |
 |------|----------|-------------|
-| `TASK_TRAIN_CHALLENGER` | Daily at 2 AM | Train new challenger model |
-| `TASK_VALIDATE_CHALLENGER` | After train | Compare challenger vs champion AUC |
-| `TASK_PROMOTE_IF_BETTER` | After validate | Promote if >1% improvement |
+| `TASK_TRAIN_CHALLENGER` | Daily at 2 AM | Train new challenger model (also scores the champion on the same holdout) |
+| `TASK_VALIDATE_CHALLENGER` | After train | Compare challenger vs champion on AUC-PR and recall@1%FPR |
+| `TASK_PROMOTE_IF_BETTER` | After validate | Promote if AUC-PR **or** recall@1%FPR improves >1% and neither regresses >1% |
+| `TASK_CHECK_DRIFT` | Daily at 2 PM | Model Monitor PSI per feature; PSI > 0.2 → `EXECUTE TASK TASK_TRAIN_CHALLENGER` (12h cooldown) |
+
+#### Promotion criteria
+Implemented in `pipeline/dag_procs.py` (`decide_promotion`, unit-tested in `tests/test_dag_procs.py`):
+- Baseline is the champion scored **on the challenger's time-based holdout** when its feature set matches; otherwise the stored `MODEL_CHAMPION_TRACKER` metrics
+- Promote when AUC-PR or recall at 1% FPR improves by >1% (relative) and neither drops by >1%
+- AUC-ROC is logged for reference only — at ~2% fraud it is close to saturated and insensitive to the precision changes that matter
+
+#### Known gap (TODO): post-inference performance
+Model Monitor currently tracks drift only. Measuring live precision/recall needs delayed ground-truth labels:
+1. Send `TRANSACTION_ID` with each inference request (autocapture currently only stores the feature vector)
+2. Join `FRAUD_INFERENCE_AUTOCAPTURE` to confirmed labels (`TRANSACTIONS.IS_FRAUD` / chargebacks) once they mature
+3. Set `ACTUAL_CLASS_COLUMNS` on the Model Monitor (or a scheduled task) so performance metrics and the drift gate both feed `TASK_CHECK_DRIFT`
 
 ## Getting Started
 
@@ -136,7 +165,20 @@ This project demonstrates a production-ready fraud detection system using:
 
 ```sql
 ALTER TASK DEMO_FRAUD_DETECTION_DB.ML_PIPELINE.TASK_TRAIN_CHALLENGER SUSPEND;
+ALTER TASK DEMO_FRAUD_DETECTION_DB.ML_PIPELINE.TASK_CHECK_DRIFT SUSPEND;
 ```
+
+### Run Tests
+
+```bash
+uv sync --group dev
+uv run pytest            # add -m "not slow" to skip the Snowpark local-testing parity test
+```
+
+### Upgrading an existing deployment
+- Re-run `02_feature_engineering.ipynb` (new Feature Views + `FRAUD_TRAINING_DATA` schema); `train.py` fails fast if required columns are missing
+- The first versioned training run renames an existing un-versioned `FRAUD_TEST_DATA` to `FRAUD_TEST_DATA_LEGACY_<ts>`
+- Re-run `05_model_monitoring.ipynb` (monitored feature list changed) and `pipeline/ml_dag.ipynb` (procedures now take arguments; tracking tables gain columns automatically)
 
 ## Key Concepts Demonstrated
 
@@ -146,6 +188,6 @@ ALTER TASK DEMO_FRAUD_DETECTION_DB.ML_PIPELINE.TASK_TRAIN_CHALLENGER SUSPEND;
 - **Tuner API**: Distributed BayesOpt HPO on Ray (Container Runtime)
 - **Experiment Tracking**: Run logging with metrics and parameters
 - **Model Registry**: Versioning, metrics, SPCS deployment
-- **Model Monitor**: PSI, Jensen-Shannon, Wasserstein drift detection
-- **Champion/Challenger**: Automated retraining DAG with promotion threshold
+- **Model Monitor**: PSI, Jensen-Shannon, Wasserstein drift detection, wired to drift-triggered retraining
+- **Champion/Challenger**: Automated retraining DAG gated on AUC-PR / recall@1%FPR
 - **Class Imbalance**: `scale_pos_weight` for rare event detection

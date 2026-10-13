@@ -21,6 +21,7 @@ import snowflake.connector
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from simulator.config import DATABASE, SCHEMA, TRANSACTIONS_TABLE, WAREHOUSE
+from source.utils import most_recent_time_at_hour
 
 
 def load_reference_data(cursor):
@@ -43,7 +44,10 @@ def generate_transaction(customer_ids, merchant_ids, merchant_categories, fraud_
 
     if is_suspicious:
         amount = float(np.random.uniform(800, 5000))
-        hour = int(np.random.choice([1, 2, 3, 4, 23]))
+        timestamp = most_recent_time_at_hour(
+            timestamp, int(np.random.choice([1, 2, 3, 4, 23]))
+        )
+        hour = timestamp.hour
         is_international = int(np.random.choice([0, 1], p=[0.3, 0.7]))
         card_present = 0
     else:
