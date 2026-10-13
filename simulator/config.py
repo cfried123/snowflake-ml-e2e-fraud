@@ -21,6 +21,11 @@ PROFILE_FV_NAME = "CUSTOMER_PROFILE_FEATURES"
 PROFILE_FV_VERSION = os.getenv("FRAUD_PROFILE_FV_VERSION", "V1")
 AGG_FV_NAME = "CUSTOMER_AGG_FEATURES"
 AGG_FV_VERSION = os.getenv("FRAUD_AGG_FV_VERSION", "V5")
+# Read the Feature Views' backing dynamic tables instead of the $ONLINE tables
+# (online tables are hybrid tables, which trial accounts do not support).
+USE_OFFLINE_FEATURES = (
+    os.getenv("FRAUD_USE_OFFLINE_FEATURES", "false").lower() == "true"
+)
 
 # Decision bands. By default they are read from the deployed model version's
 # registry metrics (review_threshold / decline_threshold, tuned on validation

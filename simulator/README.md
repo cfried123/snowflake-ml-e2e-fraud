@@ -168,3 +168,4 @@ Customers with no transactions in the window have no online aggregate row: the s
 | `FRAUD_MODEL` | Override model name (default: `FRAUD_DETECTION_MODEL`) | No |
 | `FRAUD_AGG_FV_VERSION` / `FRAUD_PROFILE_FV_VERSION` | Online Feature View versions (default: `V5` / `V1`) | No |
 | `FRAUD_REVIEW_THRESHOLD` / `FRAUD_DECLINE_THRESHOLD` | Override the decision bands (both required) | No |
+| `FRAUD_USE_OFFLINE_FEATURES` | `true` reads the Feature Views' dynamic tables instead of `$ONLINE` tables (trial accounts don't support the hybrid tables behind online features) | No |
