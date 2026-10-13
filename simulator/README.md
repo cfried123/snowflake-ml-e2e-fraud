@@ -37,10 +37,10 @@ The simulator consists of scripts that serve different purposes in the ML pipeli
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
                                         │
-                                        │ Features aggregated:
-                                        │ • AVG_TXN_AMOUNT, STD_TXN_AMOUNT
-                                        │ • TXN_COUNT, INTL_TXN_RATIO
-                                        │ • CARD_PRESENT_RATIO, etc.
+                                        │ Features aggregated (7-day window):
+                                        │ • D7_AVG_TXN_AMOUNT, D7_STD_TXN_AMOUNT
+                                        │ • D7_TXN_COUNT, D7_INTL_TXN_RATIO
+                                        │ • D7_CARD_PRESENT_RATIO, HAS_HISTORY, etc.
                                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     INFERENCE PIPELINE (Real-time)                           │
@@ -53,15 +53,15 @@ The simulator consists of scripts that serve different purposes in the ML pipeli
 │  (Customer ABC,      │  (parallel queries via ThreadPoolExecutor)           │
 │   $2500, 3am,        │                                                       │
 │   international)     ├► 2. Compute derived features in real-time            │
-│                      │     (AMOUNT_TO_AVG_RATIO, IS_ODD_HOUR, RISK_SCORE)   │
+│                      │     (source/utils.py: AMOUNT_TO_AVG_RATIO, ...)      │
 │                      │                                                       │
 │                      ├► 3. Call Model API on SPCS (/predict-proba)          │
-│                      │     (29 features)                                     │
+│                      │     (30 features, FEATURE_COLS order)                 │
 │                      ▼                                                       │
 │               ┌─────────────────┐                                            │
-│               │ APPROVE (<30%)  │                                            │
-│               │ REVIEW (30-70%) │                                            │
-│               │ DECLINE (>70%)  │                                            │
+│               │ APPROVE  < rev  │  bands tuned on validation data,           │
+│               │ REVIEW  rev-dec │  read from the deployed version's          │
+│               │ DECLINE >= dec  │  registry metrics (fallback 30%/70%)       │
 │               └─────────────────┘                                            │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -140,55 +140,20 @@ python simulator/transactions.py -n 50 -f 0.25
 | File | Description |
 |------|-------------|
 | `config.py` | Database, schema, warehouse, model, and table configuration. All values support env var overrides (see below). |
-| `utils.py` | Legacy shared module with session creation, feature vector building, and model call helpers. Note: `predict.py` and `load_test.py` use their own inline implementations. |
+| `inference.py` | Shared by `predict.py` and `load_test.py`: session creation, parameterized online feature lookups, feature-vector building (via `source/utils.py`), service/endpoint resolution, model calls and decision bands. |
 
 ## Model Input Features
 
-The fraud detection model receives **29 features** at prediction time:
+The model receives the **30 features** in `FEATURE_COLS` (`source/utils.py`), in that order. The simulator builds them with `build_serving_feature_row()`, the same derived-feature code used to build training data, so there is no hand-maintained copy of the feature list here.
 
-### Features from Online Feature Store (Customer History)
+| Group | Features | Source |
+|-------|----------|--------|
+| Transaction | `TRANSACTION_AMOUNT`, `TRANSACTION_HOUR`, `TRANSACTION_DAY_OF_WEEK`, `IS_WEEKEND`, `CARD_PRESENT`, `IS_INTERNATIONAL` | Request |
+| Profile | `ACCOUNT_AGE_DAYS`, `CREDIT_SCORE`, `AVG_MONTHLY_TRANSACTIONS`, `AVG_TRANSACTION_AMOUNT`, `NUM_CARDS_ON_FILE`, `IS_PREMIUM_MEMBER`, `NUM_PREVIOUS_FRAUD_REPORTS` | `CUSTOMER_PROFILE_FEATURES$V1$ONLINE` |
+| Aggregates (7-day) | `D7_AVG/STD/MAX/MIN/TOTAL_TXN_AMOUNT`, `D7_TXN_COUNT`, `D7_AVG/STD_TXN_HOUR`, `D7_INTL_TXN_COUNT`, `D7_INTL_TXN_RATIO`, `D7_CARD_PRESENT_RATIO`, `HAS_HISTORY` | `CUSTOMER_AGG_FEATURES$V5$ONLINE` |
+| Derived | `AMOUNT_TO_AVG_RATIO`, `AMOUNT_TO_MAX_RATIO`, `IS_HIGH_VALUE_TXN`, `IS_ODD_HOUR` (23:00-05:59), `D7_MINUTES_SINCE_LAST_TXN` | Computed at request time |
 
-| Feature | Source | Description |
-|---------|--------|-------------|
-| `ACCOUNT_AGE_DAYS` | Profile | How old the account is |
-| `CREDIT_SCORE` | Profile | Customer's credit score |
-| `AVG_MONTHLY_TRANSACTIONS` | Profile | Typical monthly volume |
-| `AVG_TRANSACTION_AMOUNT` | Profile | Typical spend |
-| `NUM_CARDS_ON_FILE` | Profile | Cards registered |
-| `IS_PREMIUM_MEMBER` | Profile | Premium status |
-| `NUM_PREVIOUS_FRAUD_REPORTS` | Profile | Past fraud history |
-| `AVG_TXN_AMOUNT` | Aggregates | Mean transaction amount |
-| `STD_TXN_AMOUNT` | Aggregates | Std dev of transaction amounts |
-| `MAX_TXN_AMOUNT` | Aggregates | Largest transaction |
-| `MIN_TXN_AMOUNT` | Aggregates | Smallest transaction |
-| `TOTAL_TXN_AMOUNT` | Aggregates | Sum of all transactions |
-| `TXN_COUNT` | Aggregates | Number of transactions |
-| `AVG_TXN_HOUR` | Aggregates | Typical hour of day |
-| `STD_TXN_HOUR` | Aggregates | Variation in transaction times |
-| `INTL_TXN_COUNT` | Aggregates | International transaction count |
-| `INTL_TXN_RATIO` | Aggregates | % of international transactions |
-| `CARD_PRESENT_RATIO` | Aggregates | % of in-person transactions |
-
-### Features from Current Transaction
-
-| Feature | Description |
-|---------|-------------|
-| `amount` | This transaction's amount |
-| `hour` | Hour of day (0-23) |
-| `day_of_week` | Day of week (0-6) |
-| `is_weekend` | Weekend flag (0/1) |
-| `card_present` | Card present flag (0/1) |
-| `is_intl` | International flag (0/1) |
-
-### Computed Risk Signals
-
-| Feature | Formula | Meaning |
-|---------|---------|---------|
-| `amount_ratio` | `amount / (avg_txn + 1)` | How unusual is the amount? |
-| `max_ratio` | `amount / (max_txn + 1)` | Does it exceed their max? |
-| `exceeds_3x_avg` | `amount > avg_txn * 3` | Big spike flag |
-| `odd_hour` | `hour in [0-5]` | Middle of night flag |
-| `risk_score` | `intl*2 + no_card*1.5` | Combined risk heuristic |
+Customers with no transactions in the window have no online aggregate row: the simulator sends `HAS_HISTORY = 0`, zero counts and JSON `null` for undefined aggregates, exactly as in training. `RISK_SCORE` is not a model input.
 
 ## Environment Variables
 
@@ -201,3 +166,5 @@ The fraud detection model receives **29 features** at prediction time:
 | `FRAUD_WH` | Override warehouse (default: `ML_WH`) | No |
 | `FRAUD_FS_WH` | Override feature serving warehouse (default: `FEATURE_SERVING_WH`) | No |
 | `FRAUD_MODEL` | Override model name (default: `FRAUD_DETECTION_MODEL`) | No |
+| `FRAUD_AGG_FV_VERSION` / `FRAUD_PROFILE_FV_VERSION` | Online Feature View versions (default: `V5` / `V1`) | No |
+| `FRAUD_REVIEW_THRESHOLD` / `FRAUD_DECLINE_THRESHOLD` | Override the decision bands (both required) | No |
